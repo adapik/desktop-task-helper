@@ -90,11 +90,18 @@ class TrayManager(
     }
 
     private fun updateAppIndicator(items: List<TaskItem>) {
-        val iconPath = File(iconDir, "icon-${items.size}.png").absolutePath
-        val appInd = AppIndicator.INSTANCE
-        appInd.app_indicator_set_icon(indicator, iconPath)
-        rebuildGtkMenu(items)
+        val gtk = Gtk.INSTANCE
+        val func = GSourceFunc { _ ->
+            val iconPath = File(iconDir, "icon-${items.size}.png").absolutePath
+            AppIndicator.INSTANCE.app_indicator_set_icon(indicator, iconPath)
+            rebuildGtkMenu(items)
+            0 // G_SOURCE_REMOVE — run once
+        }
+        idleFuncRefs.add(func) // prevent GC
+        gtk.g_idle_add(func, null)
     }
+
+    private val idleFuncRefs = mutableListOf<GSourceFunc>()
 
     private fun rebuildGtkMenu(items: List<TaskItem>) {
         val gtk = Gtk.INSTANCE
@@ -114,7 +121,7 @@ class TrayManager(
                 val label = "${item.id}  \u2014  ${truncate(item.title, 55)}"
                 val menuItem = gtk.gtk_menu_item_new_with_label(label)
                 val url = item.url
-                val callback = GtkCallback { _, _ -> onItemClick(item) }
+                val callback = GtkCallback { _, _ -> Thread { onItemClick(item) }.start() }
                 gtk.g_signal_connect_data(menuItem, "activate", callback, null, null, 0)
                 // prevent callback from being GC'd
                 callbackRefs.add(callback)
@@ -133,7 +140,7 @@ class TrayManager(
             githubItems.forEach { item ->
                 val label = "${item.id}  \u2014  ${truncate(item.title, 55)}"
                 val menuItem = gtk.gtk_menu_item_new_with_label(label)
-                val callback = GtkCallback { _, _ -> onItemClick(item) }
+                val callback = GtkCallback { _, _ -> Thread { onItemClick(item) }.start() }
                 gtk.g_signal_connect_data(menuItem, "activate", callback, null, null, 0)
                 callbackRefs.add(callback)
                 gtk.gtk_menu_shell_append(gtkMenu, menuItem)
@@ -155,7 +162,7 @@ class TrayManager(
         gtk.gtk_menu_shell_append(gtkMenu, refresh)
 
         val settings = gtk.gtk_menu_item_new_with_label("Settings")
-        val settingsCb = GtkCallback { _, _ -> onSettings() }
+        val settingsCb = GtkCallback { _, _ -> Thread { onSettings() }.start() }
         gtk.g_signal_connect_data(settings, "activate", settingsCb, null, null, 0)
         callbackRefs.add(settingsCb)
         gtk.gtk_menu_shell_append(gtkMenu, settings)
@@ -353,6 +360,10 @@ class TrayManager(
         fun invoke(widget: Pointer?, data: Pointer?)
     }
 
+    fun interface GSourceFunc : Callback {
+        fun invoke(data: Pointer?): Int
+    }
+
     interface Gtk : Library {
         companion object {
             val INSTANCE: Gtk = Native.load("gtk-3", Gtk::class.java)
@@ -367,6 +378,7 @@ class TrayManager(
         fun gtk_menu_shell_append(menu: Pointer?, item: Pointer?)
         fun gtk_widget_show_all(widget: Pointer?)
         fun gtk_widget_set_sensitive(widget: Pointer?, sensitive: Int)
+        fun g_idle_add(function_: GSourceFunc, data: Pointer?): Int
         fun g_signal_connect_data(
             instance: Pointer?, signal: String, callback: Callback?,
             data: Pointer?, destroyData: Pointer?, flags: Int

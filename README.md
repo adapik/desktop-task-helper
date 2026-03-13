@@ -52,10 +52,12 @@ A lightweight system tray application that keeps you on top of **Jira tasks** an
   gh auth login
   ```
 - **Jira API Token** -- generate at [Atlassian API Tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
-- **Linux only**: `libayatana-appindicator3` (pre-installed on Ubuntu/GNOME)
+- **Linux only**:
+  - `libayatana-appindicator3` -- native system tray (pre-installed on Ubuntu/GNOME)
+  - `notify-send` -- clickable desktop notifications (from `libnotify-bin`, pre-installed on most desktops)
   ```bash
   # If missing:
-  sudo apt install libayatana-appindicator3-1
+  sudo apt install libayatana-appindicator3-1 libnotify-bin
   ```
 
 ## Getting Started

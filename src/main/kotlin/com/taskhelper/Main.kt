@@ -15,7 +15,7 @@ fun main() {
 
     var config = Config.load()
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    val notificationManager = NotificationManager()
+    val notificationManager = NotificationManager(onNotificationClick = ::openInBrowser)
     var pollingService: PollingService? = null
 
     trayManager = TrayManager(
@@ -51,16 +51,17 @@ fun main() {
 private fun openInBrowser(url: String) {
     try {
         val os = System.getProperty("os.name").lowercase()
-        when {
-            Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE) -> {
-                Desktop.getDesktop().browse(java.net.URI(url))
-            }
-            os.contains("linux") -> {
-                Runtime.getRuntime().exec(arrayOf("xdg-open", url))
-            }
-            os.contains("mac") -> {
-                Runtime.getRuntime().exec(arrayOf("open", url))
-            }
+        val command = when {
+            os.contains("linux") -> arrayOf("xdg-open", url)
+            os.contains("mac") -> arrayOf("open", url)
+            else -> null
+        }
+        if (command != null) {
+            ProcessBuilder(*command)
+                .redirectErrorStream(true)
+                .start()
+        } else if (Desktop.isDesktopSupported()) {
+            Desktop.getDesktop().browse(java.net.URI(url))
         }
     } catch (e: Exception) {
         System.err.println("Failed to open browser: ${e.message}")
