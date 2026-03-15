@@ -3,12 +3,11 @@ package com.taskhelper.tray
 import com.taskhelper.model.ItemSource
 import com.taskhelper.model.TaskItem
 import com.sun.jna.*
-import com.sun.jna.ptr.PointerByReference
 import java.awt.*
 import java.awt.image.BufferedImage
 import java.io.File
 import javax.imageio.ImageIO
-import javax.swing.*
+import javax.swing.UIManager
 
 class TrayManager(
     private val onItemClick: (TaskItem) -> Unit,
@@ -20,13 +19,12 @@ class TrayManager(
     private val iconDir = File(System.getProperty("java.io.tmpdir"), "taskhelper-icons").apply { mkdirs() }
     private var useNativeTray = false
 
-    // Native AppIndicator via JNA
+    // Native AppIndicator via JNA (Linux only)
     private var indicator: Pointer? = null
     private var gtkMenu: Pointer? = null
 
-    // Fallback AWT
+    // AWT SystemTray (macOS and fallback)
     private var trayIcon: TrayIcon? = null
-    private var hiddenWindow: JWindow? = null
 
     fun init() {
         UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName())
@@ -42,21 +40,18 @@ class TrayManager(
         currentItems = items
         saveIcon(items.size)
 
-        if (useNativeTray) {
-            updateAppIndicator(items)
-        } else {
-            updateAwtTray(items)
-        }
+        if (useNativeTray) updateAppIndicator(items)
+        else updateAwtTray(items)
     }
 
-    // ========== Native AppIndicator ==========
+    // ========== Native AppIndicator (Linux) ==========
 
     private fun tryInitAppIndicator(): Boolean {
+        if (!System.getProperty("os.name").lowercase().contains("linux")) return false
         return try {
             val gtk = Gtk.INSTANCE
             val appInd = AppIndicator.INSTANCE
 
-            // Init GTK (required for AppIndicator)
             gtk.gtk_init(0, null)
 
             val iconPath = File(iconDir, "icon-0.png").absolutePath
@@ -68,12 +63,10 @@ class TrayManager(
 
             appInd.app_indicator_set_status(indicator, 1) // APP_INDICATOR_STATUS_ACTIVE
 
-            // Create initial menu (required by AppIndicator)
             gtkMenu = gtk.gtk_menu_new()
             rebuildGtkMenu(emptyList())
             appInd.app_indicator_set_menu(indicator, gtkMenu)
 
-            // Run GTK main loop in background thread
             Thread({
                 gtk.gtk_main()
             }, "gtk-main").apply {
@@ -95,9 +88,9 @@ class TrayManager(
             val iconPath = File(iconDir, "icon-${items.size}.png").absolutePath
             AppIndicator.INSTANCE.app_indicator_set_icon(indicator, iconPath)
             rebuildGtkMenu(items)
-            0 // G_SOURCE_REMOVE — run once
+            0 // G_SOURCE_REMOVE
         }
-        idleFuncRefs.add(func) // prevent GC
+        idleFuncRefs.add(func)
         gtk.g_idle_add(func, null)
     }
 
@@ -120,10 +113,8 @@ class TrayManager(
             jiraItems.forEach { item ->
                 val label = "${item.id}  \u2014  ${truncate(item.title, 55)}"
                 val menuItem = gtk.gtk_menu_item_new_with_label(label)
-                val url = item.url
                 val callback = GtkCallback { _, _ -> Thread { onItemClick(item) }.start() }
                 gtk.g_signal_connect_data(menuItem, "activate", callback, null, null, 0)
-                // prevent callback from being GC'd
                 callbackRefs.add(callback)
                 gtk.gtk_menu_shell_append(gtkMenu, menuItem)
             }
@@ -179,29 +170,26 @@ class TrayManager(
         appInd.app_indicator_set_menu(indicator, gtkMenu)
     }
 
-    // prevent GC of JNA callbacks
     private val callbackRefs = mutableListOf<GtkCallback>()
 
-    // ========== AWT fallback (macOS) ==========
+    // ========== AWT SystemTray (macOS and fallback) ==========
+    //
+    // On macOS, AWT's TrayIcon is backed by a real NSStatusItem, and the attached
+    // PopupMenu is converted to a native NSMenu. This means the menu auto-dismisses
+    // on outside click just like any native macOS menu — no JNA/ObjC wrangling needed.
 
     private fun initAwtTray() {
         if (!SystemTray.isSupported()) {
             error("System tray is not supported on this platform")
         }
 
-        hiddenWindow = JWindow().apply { isAlwaysOnTop = true }
-
-        val icon = loadIcon(0)
-        trayIcon = TrayIcon(icon, "Task Helper").apply {
+        val popup = PopupMenu()
+        trayIcon = TrayIcon(loadIcon(0), "Task Helper", popup).apply {
             isImageAutoSize = true
-            addMouseListener(object : java.awt.event.MouseAdapter() {
-                override fun mouseClicked(e: java.awt.event.MouseEvent) {
-                    showSwingPopup(e.x, e.y)
-                }
-            })
         }
-        SystemTray.getSystemTray().add(trayIcon)
-        println("Using AWT SystemTray (fallback)")
+        SystemTray.getSystemTray().add(trayIcon!!)
+        rebuildAwtPopup(emptyList())
+        println("Using AWT SystemTray")
     }
 
     private fun updateAwtTray(items: List<TaskItem>) {
@@ -211,80 +199,45 @@ class TrayManager(
         } else {
             "Task Helper \u2014 ${items.size} item(s) need attention"
         }
+        // Rebuild on EDT — required for AWT component modifications.
+        javax.swing.SwingUtilities.invokeLater { rebuildAwtPopup(items) }
     }
 
-    private fun showSwingPopup(x: Int, y: Int) {
-        val popup = JPopupMenu()
-        popup.border = BorderFactory.createCompoundBorder(
-            BorderFactory.createLineBorder(UIManager.getColor("Separator.foreground") ?: Color.GRAY),
-            BorderFactory.createEmptyBorder(4, 0, 4, 0)
-        )
+    private fun rebuildAwtPopup(items: List<TaskItem>) {
+        val popup = trayIcon?.popupMenu ?: return
+        popup.removeAll()
 
-        val jiraItems = currentItems.filter { it.source == ItemSource.JIRA }
-        val githubItems = currentItems.filter { it.source == ItemSource.GITHUB }
+        val jiraItems = items.filter { it.source == ItemSource.JIRA }
+        val githubItems = items.filter { it.source == ItemSource.GITHUB }
 
         if (jiraItems.isNotEmpty()) {
-            popup.add(createHeader("Jira Tasks  (${jiraItems.size})"))
-            jiraItems.forEach { popup.add(createTaskMenuItem(it)) }
+            popup.add(MenuItem("Jira Tasks (${jiraItems.size})").apply { isEnabled = false })
+            jiraItems.forEach { item ->
+                popup.add(MenuItem("   ${item.id}  \u2014  ${truncate(item.title, 55)}").apply {
+                    addActionListener { Thread { onItemClick(item) }.start() }
+                })
+            }
         }
+
         if (githubItems.isNotEmpty()) {
             if (jiraItems.isNotEmpty()) popup.addSeparator()
-            popup.add(createHeader("PR Reviews  (${githubItems.size})"))
-            githubItems.forEach { popup.add(createTaskMenuItem(it)) }
+            popup.add(MenuItem("PR Reviews (${githubItems.size})").apply { isEnabled = false })
+            githubItems.forEach { item ->
+                popup.add(MenuItem("   ${item.id}  \u2014  ${truncate(item.title, 55)}").apply {
+                    addActionListener { Thread { onItemClick(item) }.start() }
+                })
+            }
         }
-        if (currentItems.isEmpty()) {
-            popup.add(JMenuItem("No items need attention").apply {
-                isEnabled = false
-                border = BorderFactory.createEmptyBorder(4, 12, 4, 12)
-            })
+
+        if (items.isEmpty()) {
+            popup.add(MenuItem("No items need attention").apply { isEnabled = false })
         }
 
         popup.addSeparator()
-        popup.add(JMenuItem("Refresh").apply {
-            border = BorderFactory.createEmptyBorder(4, 12, 4, 12)
-            addActionListener { onRefreshListener?.invoke() }
-        })
-        popup.add(JMenuItem("Settings").apply {
-            border = BorderFactory.createEmptyBorder(4, 12, 4, 12)
-            addActionListener { onSettings() }
-        })
+        popup.add(MenuItem("Refresh").apply { addActionListener { onRefreshListener?.invoke() } })
+        popup.add(MenuItem("Settings").apply { addActionListener { Thread { onSettings() }.start() } })
         popup.addSeparator()
-        popup.add(JMenuItem("Quit").apply {
-            border = BorderFactory.createEmptyBorder(4, 12, 4, 12)
-            addActionListener { onQuit() }
-        })
-
-        val screen = Toolkit.getDefaultToolkit().screenSize
-        val ps = popup.preferredSize
-        val px = if (x + ps.width > screen.width) screen.width - ps.width else x
-        val py = if (y + ps.height > screen.height) y - ps.height else y
-
-        hiddenWindow?.setLocation(px, py)
-        hiddenWindow?.setSize(1, 1)
-        hiddenWindow?.isVisible = true
-
-        popup.addPopupMenuListener(object : javax.swing.event.PopupMenuListener {
-            override fun popupMenuWillBecomeVisible(e: javax.swing.event.PopupMenuEvent) {}
-            override fun popupMenuWillBecomeInvisible(e: javax.swing.event.PopupMenuEvent) { hiddenWindow?.isVisible = false }
-            override fun popupMenuCanceled(e: javax.swing.event.PopupMenuEvent) { hiddenWindow?.isVisible = false }
-        })
-        popup.show(hiddenWindow, 0, 0)
-    }
-
-    private fun createHeader(text: String): JMenuItem {
-        return JMenuItem(text).apply {
-            isEnabled = false
-            font = font.deriveFont(Font.BOLD, font.size.toFloat())
-            border = BorderFactory.createEmptyBorder(6, 12, 2, 12)
-        }
-    }
-
-    private fun createTaskMenuItem(item: TaskItem): JMenuItem {
-        return JMenuItem("${item.id}  \u2014  ${truncate(item.title, 55)}").apply {
-            border = BorderFactory.createEmptyBorder(4, 20, 4, 12)
-            toolTipText = item.title
-            addActionListener { onItemClick(item) }
-        }
+        popup.add(MenuItem("Quit").apply { addActionListener { onQuit() } })
     }
 
     // ========== Icon rendering ==========
@@ -347,14 +300,13 @@ class TrayManager(
     var onRefreshListener: (() -> Unit)? = null
 
     fun destroy() {
-        if (useNativeTray) {
-            try { Gtk.INSTANCE.gtk_main_quit() } catch (_: Exception) {}
-        } else {
-            trayIcon?.let { SystemTray.getSystemTray().remove(it) }
+        when {
+            useNativeTray -> try { Gtk.INSTANCE.gtk_main_quit() } catch (_: Exception) {}
+            else -> trayIcon?.let { SystemTray.getSystemTray().remove(it) }
         }
     }
 
-    // ========== JNA interfaces ==========
+    // ========== JNA interfaces (Linux GTK only) ==========
 
     fun interface GtkCallback : Callback {
         fun invoke(widget: Pointer?, data: Pointer?)
